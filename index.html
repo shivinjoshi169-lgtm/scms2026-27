@@ -1026,8 +1026,8 @@ tbody tr:hover{background:var(--bg-hover)}
    ============================================================ */
 
 /* ---------- Supabase Configuration ---------- */
-const SUPABASE_URL = 'https://tpstdbzeuapwweywvbet.supabase.co';
-const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRwc3RkYnpldWFwd3dleXd2YmV0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ0MzY2NjEsImV4cCI6MjEwMDAxMjY2MX0.cdkNxU7sbNApD9pj_ZGCxW0N0dvr7y74p1NjSR3bTb4';
+const SUPABASE_URL = 'https://nguvhpjhquuioniurphb.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5ndXZocGpocXV1aW9uaXVycGhiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ2Mjc2MDgsImV4cCI6MjEwMDIwMzYwOH0.-sAnr9INOHv8AdYdDw7wozM_tPeIBxtTSXi1xwBz1mk';
 
 /* ---------- Globals ---------- */
 let supabase = null;
@@ -1169,20 +1169,13 @@ function showApp(){
   $('#app').classList.add('show');
 }
 
-/* ---------- Audit log helper ---------- */
-async function logAudit(action, entityType, entityId, details={}){
-  if(!supabase || !currentProfile) return;
-  try{
-    await supabase.from('audit_logs').insert({
-      user_id: currentProfile.id,
-      action: action,
-      table_name: entityType,
-      record_id: entityId ? String(entityId) : null,
-      old_value: details.old || null,
-      new_value: details.new || details || null
-    });
-  }catch(e){ /* audit logging is best-effort */ }
-}
+/* ---------- Audit log helper ----------
+   NOTE: audit_logs is written exclusively by server-side SECURITY DEFINER
+   triggers (fn_audit_row) on every insert/update/delete of the audited
+   tables. There is intentionally NO client insert policy on audit_logs,
+   so this is kept as a no-op for backward compatibility with existing
+   call sites rather than attempting (and silently failing) a write. */
+async function logAudit(){ /* server-side triggers handle this automatically */ }
 
 /* ---------- Supabase Initialization ---------- */
 function initSupabase(){
@@ -1246,7 +1239,6 @@ async function handleLogin(email, password, remember){
 
     currentUser = data.user;
     currentProfile = profile;
-    await logAudit('login','auth',currentUser.id,{email:currentUser.email});
     await loadAppCache();
     showApp();
     renderApp();
@@ -1288,7 +1280,6 @@ async function loadUserProfile(userId){
 /* ---------- Logout ---------- */
 async function handleLogout(){
   try{
-    await logAudit('logout','auth',currentUser?.id||null);
     await supabase.auth.signOut();
   }catch(e){ /* ignore */ }
   currentUser = null;
@@ -1342,9 +1333,22 @@ function renderApp(){
   $('#sidebarUserRole').textContent = (currentProfile?.role || 'user').replace(/_/g,' ');
   $('#sidebarUserAvatar').textContent = getInitials(currentProfile?.full_name);
 
-  const isAdmin = currentProfile?.role === 'admin';
+  const showNav = (mod, visible) => {
+    const el = $(`.nav-item[data-module="${mod}"]`);
+    if(el) el.style.display = visible ? '' : 'none';
+  };
+  showNav('dashboard', true);
+  showNav('members', canViewCouncil());
+  showNav('users', isAdmin());
+  showNav('events', canViewContent());
+  showNav('meetings', canViewContent());
+  showNav('announcements', canViewContent());
+  showNav('discipline', canAccessDiscipline());
+  showNav('hpi', canViewHPI());
+  showNav('settings', true);
+
   $$('[data-admin-only]').forEach(el=>{
-    el.style.display = isAdmin ? '' : 'none';
+    el.style.display = isAdmin() ? '' : 'none';
   });
 }
 
@@ -1378,9 +1382,23 @@ function navigateTo(module){
   if(fn) fn();
 }
 
-/* ---------- Role check helpers ---------- */
-function isAdmin(){ return currentProfile?.role === 'admin'; }
-function isStaff(){ return ['admin','teacher'].includes(currentProfile?.role); }
+/* ---------- Role check helpers ----------
+   Mirrors the SQL permission functions exactly (fn_is_admin, fn_is_staff,
+   fn_can_manage_content, fn_can_view_content, fn_can_manage_council,
+   fn_can_access_discipline, fn_can_review_discipline, fn_can_view_hpi,
+   fn_can_vote_hpi) — the frontend only reflects what the DB/RLS allows,
+   it never decides permissions on its own. */
+function currentRole(){ return currentProfile?.role; }
+function isAdmin(){ return currentRole() === 'admin'; }
+function isStaff(){ return ['admin','teacher'].includes(currentRole()); }
+function canManageContent(){ return ['admin','teacher','black_badge'].includes(currentRole()); }
+function canViewContent(){ return ['admin','teacher','black_badge','student'].includes(currentRole()); }
+function canManageCouncil(){ return ['admin','black_badge'].includes(currentRole()); }
+function canViewCouncil(){ return ['admin','teacher','black_badge'].includes(currentRole()); }
+function canAccessDiscipline(){ return ['admin','teacher','black_badge','house_badge'].includes(currentRole()); }
+function canReviewDiscipline(){ return isStaff(); }
+function canViewHPI(){ return ['admin','teacher','black_badge','house_badge'].includes(currentRole()); }
+function canVoteHPI(){ return isStaff(); }
 
 /* ---------- Dashboard Module ---------- */
 async function renderDashboard(){
@@ -1481,11 +1499,13 @@ function renderSkeletonStats(){
 async function loadDashboardData(){
   try{
     const [members, events, meetings, announcements, discipline] = await Promise.all([
-      supabase.from('council_members').select('id,house:houses(id,name,color)',{count:'exact'}),
+      supabase.from('council_positions').select('id,house:houses(id,name,color)',{count:'exact'}).eq('is_current', true),
       supabase.from('events').select('id,name,event_date,venue,status').gte('event_date', new Date().toISOString()).order('event_date',{ascending:true}).limit(5),
       supabase.from('meetings').select('id,title,meeting_date,venue,status').gte('meeting_date', new Date().toISOString()).order('meeting_date',{ascending:true}).limit(5),
       supabase.from('announcements').select('id,title,priority,created_at,expiry_date').order('created_at',{ascending:false}).limit(5),
-      supabase.from('discipline_reports').select('id,student:profiles!discipline_reports_student_id_fkey(full_name),description,severity,incident_date,created_at').eq('status','pending').order('created_at',{ascending:false}).limit(5)
+      canAccessDiscipline()
+        ? supabase.from('discipline_reports').select('id,student_name,student_class,description,severity,incident_date,created_at').eq('status','pending').order('created_at',{ascending:false}).limit(5)
+        : Promise.resolve({ data: [] })
     ]);
 
     const pendingCount = discipline.data?.length || 0;
@@ -1610,7 +1630,7 @@ function renderDashboardDiscipline(items){
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
       </div>
       <div class="list-item-content">
-        <div class="list-item-title">${escapeHtml(d.student?.full_name||'Unknown student')}</div>
+        <div class="list-item-title">${escapeHtml(d.student_name||'Unknown student')}${d.student_class?` <span class="text-xs text-muted">(${escapeHtml(d.student_class)})</span>`:''}</div>
         <div class="list-item-sub">${escapeHtml((d.description||'').slice(0,80))}${(d.description||'').length>80?'…':''}</div>
       </div>
       <div class="list-item-meta">
@@ -1666,8 +1686,9 @@ async function renderDashboardCharts(){
     }
 
     const { data: memData } = await supabase
-      .from('council_members')
-      .select('house:houses(id,name,color)');
+      .from('council_positions')
+      .select('house:houses(id,name,color)')
+      .eq('is_current', true);
     const memMap = {};
     (memData||[]).forEach(m=>{
       const h = m.house; if(!h) return;
@@ -1729,7 +1750,16 @@ function tableSkeleton(cols=4){
 let membersState = { search:'', houseFilter:'', page:1, data:[], loading:false };
 
 async function renderMembers(){
+  if(!canViewCouncil()){
+    $('#module-members').innerHTML = `<div class="empty-state">
+      <div class="empty-state-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
+      <div class="empty-state-title">Access restricted</div>
+      <div class="empty-state-text">You do not have permission to view the council roster.</div>
+    </div>`;
+    return;
+  }
   const container = $('#module-members');
+  const canManage = canManageCouncil();
   container.innerHTML = `
     <div class="page-header">
       <div>
@@ -1737,10 +1767,10 @@ async function renderMembers(){
         <div class="page-subtitle">Manage council composition across houses and positions.</div>
       </div>
       <div class="page-actions">
-        <button class="btn btn-primary-solid" onclick="openMemberModal()">
+        ${canManage ? `<button class="btn btn-primary-solid" onclick="openMemberModal()">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
           Add Member
-        </button>
+        </button>` : ''}
       </div>
     </div>
 
@@ -1774,13 +1804,11 @@ async function loadMembers(){
   if(!wrap) return;
   wrap.innerHTML = tableSkeleton();
   try{
+    // v_council_roster resolves profile/position/house names server-side,
+    // avoiding N+1 joins — it is a straight select view over council_positions.
     let q = supabase
-      .from('council_members')
-      .select(`
-        id, academic_year, created_at, name, class, section,
-        house:houses(id, name, color),
-        position:positions(id, title, category, display_order)
-      `)
+      .from('v_council_roster')
+      .select('*')
       .order('created_at', { ascending:false });
 
     if(membersState.houseFilter){
@@ -1794,8 +1822,8 @@ async function loadMembers(){
     if(membersState.search){
       const s = membersState.search.toLowerCase();
       filtered = filtered.filter(m=>{
-        const name = (m.name||'').toLowerCase();
-        const pos = (m.position?.title||'').toLowerCase();
+        const name = (m.full_name||'').toLowerCase();
+        const pos = (m.position_title||'').toLowerCase();
         return name.includes(s) || pos.includes(s);
       });
     }
@@ -1818,6 +1846,7 @@ function renderMembersTable(members){
     wrap.innerHTML = emptyState('No council members','Add your first council member to get started.','users');
     return;
   }
+  const canManage = canManageCouncil();
   wrap.innerHTML = `
     <div class="table-wrap">
       <table>
@@ -1827,7 +1856,8 @@ function renderMembersTable(members){
             <th>House</th>
             <th>Position</th>
             <th>Academic Year</th>
-            <th class="text-right">Actions</th>
+            <th>Status</th>
+            ${canManage ? '<th class="text-right">Actions</th>' : ''}
           </tr>
         </thead>
         <tbody>
@@ -1835,18 +1865,20 @@ function renderMembersTable(members){
             <tr>
               <td>
                 <div class="table-avatar">
-                  <div class="table-avatar-circle">${getInitials(m.name)}</div>
+                  <div class="table-avatar-circle">${getInitials(m.full_name)}</div>
                   <div>
-                    <div style="font-weight:600">${escapeHtml(m.name||'Unknown')}</div>
+                    <div style="font-weight:600">${escapeHtml(m.full_name||'Unknown')}</div>
                     <div class="text-xs text-muted">${escapeHtml(m.class||'')} ${escapeHtml(m.section||'')}</div>
                   </div>
                 </div>
               </td>
               <td>
-                ${m.house?`<span class="badge" style="background:${m.house.color||'var(--primary-soft)'}20;color:${m.house.color||'var(--primary)'}"><span class="badge-dot"></span>${escapeHtml(m.house.name)}</span>`:'<span class="text-muted">—</span>'}
+                ${m.house_name?`<span class="badge" style="background:${m.house_color||'var(--primary-soft)'}20;color:${m.house_color||'var(--primary)'}"><span class="badge-dot"></span>${escapeHtml(m.house_name)}</span>`:'<span class="text-muted">—</span>'}
               </td>
-              <td>${escapeHtml(m.position?.title||'—')}</td>
+              <td>${escapeHtml(m.position_title||'—')}</td>
               <td>${escapeHtml(m.academic_year||'—')}</td>
+              <td><span class="badge ${m.is_current?'badge-success':'badge-neutral'}">${m.is_current?'Current':'Past'}</span></td>
+              ${canManage ? `
               <td class="text-right">
                 <button class="btn btn-ghost btn-icon" title="Edit" onclick="openMemberModal('${m.id}')">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
@@ -1854,7 +1886,7 @@ function renderMembersTable(members){
                 <button class="btn btn-ghost btn-icon btn-danger-ghost" title="Delete" onclick="deleteMember('${m.id}')">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
                 </button>
-              </td>
+              </td>` : ''}
             </tr>
           `).join('')}
         </tbody>
@@ -1864,15 +1896,31 @@ function renderMembersTable(members){
 }
 
 async function openMemberModal(id=null){
+  if(!canManageCouncil()){ toast('You do not have permission to manage the council roster','warning'); return; }
+
   let member = null;
   if(id){
+    // Read from the view for display defaults (has profile_id/position_id/house_id already resolved).
     const { data, error } = await supabase
-      .from('council_members')
-      .select(`*`)
+      .from('v_council_roster')
+      .select('*')
       .eq('id', id).single();
     if(error){ toast('Failed to load member','error'); return; }
     member = data;
   }
+
+  // Council roster entries reference an existing profile by FK (profile_id) —
+  // never a free-text name — per council_positions schema.
+  const { data: profiles, error: profErr } = await supabase
+    .from('profiles')
+    .select('id, full_name, class, section')
+    .eq('is_active', true)
+    .order('full_name');
+  if(profErr){ toast('Failed to load user directory','error'); return; }
+
+  const profileOpts = (profiles||[]).map(p=>
+    `<option value="${p.id}" ${member?.profile_id===p.id?'selected':''}>${escapeHtml(p.full_name)}${p.class?` — ${escapeHtml(p.class)}${p.section?' '+escapeHtml(p.section):''}`:''}</option>`
+  ).join('');
 
   const houseOpts = appCache.houses.map(h=>`<option value="${h.id}" ${member?.house_id===h.id?'selected':''}>${escapeHtml(h.name)}</option>`).join('');
   const currentYear = new Date().getFullYear();
@@ -1884,17 +1932,12 @@ async function openMemberModal(id=null){
     `
       <form id="memberForm">
         <div class="form-grid">
-          <div class="field">
-            <label class="field-label">Member Name *</label>
-            <input class="field-input" name="name" value="${escapeHtml(member?.name||'')}" required />
-          </div>
-          <div class="field">
-            <label class="field-label">Class</label>
-            <input class="field-input" name="class" value="${escapeHtml(member?.class||'')}" />
-          </div>
-          <div class="field">
-            <label class="field-label">Section</label>
-            <input class="field-input" name="section" value="${escapeHtml(member?.section||'')}" />
+          <div class="field form-grid-2">
+            <label class="field-label">User *</label>
+            <select class="field-select" name="profile_id" required>
+              <option value="">Select user...</option>
+              ${profileOpts}
+            </select>
           </div>
           <div class="field">
             <label class="field-label">House</label>
@@ -1913,6 +1956,13 @@ async function openMemberModal(id=null){
             <label class="field-label">Academic Year</label>
             <select class="field-select" name="academic_year">${yearOpts}</select>
           </div>
+          <div class="field">
+            <label class="field-label">Status</label>
+            <select class="field-select" name="is_current">
+              <option value="true" ${member?.is_current!==false?'selected':''}>Current</option>
+              <option value="false" ${member?.is_current===false?'selected':''}>Past</option>
+            </select>
+          </div>
         </div>
       </form>
     `,
@@ -1923,18 +1973,16 @@ async function openMemberModal(id=null){
 
   const houseSelect = $('#memberHouseSelect');
   const posSelect = $('#memberPositionSelect');
-  
+
   const updatePositions = () => {
     const houseId = houseSelect.value;
-    const housePositions = ['Captain', 'Vice Captain', 'Junior Captain', 'Prefect'];
-    const generalPositions = ['Head Boy', 'Head Girl', 'Vice Head Boy', 'Vice Head Girl', 'Junior Head Boy', 'Junior Head Girl', 'Sports Incharge', 'Cultural Incharge', 'Literary Incharge', 'Discipline Incharge', 'Print & Media Incharge'];
 
     let validPositions = appCache.positions.filter(p => {
-      if(houseId) return housePositions.includes(p.title);
-      return generalPositions.includes(p.title);
+      if(houseId) return p.category === 'house';
+      return p.category === 'general';
     });
 
-    posSelect.innerHTML = '<option value="">Select position...</option>' + validPositions.map(p => 
+    posSelect.innerHTML = '<option value="">Select position...</option>' + validPositions.map(p =>
       `<option value="${p.id}" ${member?.position_id===p.id?'selected':''}>${escapeHtml(p.title)}</option>`
     ).join('');
   };
@@ -1947,26 +1995,25 @@ async function openMemberModal(id=null){
     const form = $('#memberForm');
     const fd = new FormData(form);
     const payload = {
+      profile_id: fd.get('profile_id'),
       house_id: fd.get('house_id') || null,
       position_id: fd.get('position_id'),
       academic_year: fd.get('academic_year'),
-      name: fd.get('name'),
-      class: fd.get('class') || null,
-      section: fd.get('section') || null
+      is_current: fd.get('is_current') === 'true'
     };
-    if(!payload.name || !payload.position_id){
+    if(!payload.profile_id || !payload.position_id){
       toast('Please fill all required fields','warning'); return;
     }
     const btn = $('#saveMemberBtn');
     btn.disabled = true; btn.textContent = 'Saving...';
     try{
       let result;
+      // General position => no house; house position => house required.
+      // This is also enforced server-side by trg_validate_council_position.
       if(id){
-        result = await supabase.from('council_members').update(payload).eq('id', id);
-        await logAudit('update','council_members', id, payload);
+        result = await supabase.from('council_positions').update(payload).eq('id', id);
       }else{
-        result = await supabase.from('council_members').insert(payload).select().single();
-        await logAudit('create','council_members', result.data?.id, payload);
+        result = await supabase.from('council_positions').insert(payload).select().single();
       }
       if(result.error) throw result.error;
       toast(id?'Member updated':'Member added','success');
@@ -1980,13 +2027,13 @@ async function openMemberModal(id=null){
 }
 
 async function deleteMember(id){
+  if(!canManageCouncil()){ toast('You do not have permission to manage the council roster','warning'); return; }
   confirmAction(
     'Delete Member',
     'Are you sure you want to remove this council member? This action cannot be undone.',
     async ()=>{
-      const { error } = await supabase.from('council_members').delete().eq('id', id);
+      const { error } = await supabase.from('council_positions').delete().eq('id', id);
       if(error) throw error;
-      await logAudit('delete','council_members', id);
       toast('Member removed','success');
       loadMembers();
     },
@@ -2028,8 +2075,9 @@ async function renderUsers(){
         <option value="">All Roles</option>
         <option value="admin" ${usersState.roleFilter==='admin'?'selected':''}>Admin</option>
         <option value="teacher" ${usersState.roleFilter==='teacher'?'selected':''}>Teacher</option>
+        <option value="black_badge" ${usersState.roleFilter==='black_badge'?'selected':''}>Black Badge</option>
+        <option value="house_badge" ${usersState.roleFilter==='house_badge'?'selected':''}>House Badge</option>
         <option value="student" ${usersState.roleFilter==='student'?'selected':''}>Student</option>
-        <option value="council_member" ${usersState.roleFilter==='council_member'?'selected':''}>Council Member</option>
       </select>
     </div>
 
@@ -2053,11 +2101,7 @@ async function loadUsers(){
   try{
     let q = supabase
       .from('profiles')
-      .select(`
-        id, username, full_name, role, is_active, created_at,
-        house:houses(id, name, color),
-        position:positions(id, title)
-      `)
+      .select('id, username, full_name, role, class, section, is_active, created_at')
       .order('created_at', { ascending:false });
 
     if(usersState.roleFilter){
@@ -2091,7 +2135,7 @@ function renderUsersTable(users){
     wrap.innerHTML = emptyState('No users found','Create your first user to get started.','users');
     return;
   }
-  const roleBadge = { admin:'badge-danger', teacher:'badge-info', student:'badge-neutral', council_member:'badge-purple' };
+  const roleBadge = { admin:'badge-danger', teacher:'badge-info', black_badge:'badge-purple', house_badge:'badge-warning', student:'badge-neutral' };
   wrap.innerHTML = `
     <div class="table-wrap">
       <table>
@@ -2099,8 +2143,7 @@ function renderUsersTable(users){
           <tr>
             <th>User</th>
             <th>Role</th>
-            <th>House</th>
-            <th>Position</th>
+            <th>Class</th>
             <th>Status</th>
             <th>Created</th>
             <th class="text-right">Actions</th>
@@ -2119,8 +2162,7 @@ function renderUsersTable(users){
                 </div>
               </td>
               <td><span class="badge ${roleBadge[u.role]||'badge-neutral'}">${escapeHtml((u.role||'').replace(/_/g,' '))}</span></td>
-              <td>${u.house?`<span class="badge" style="background:${u.house.color||'var(--primary-soft)'}20;color:${u.house.color||'var(--primary)'}">${escapeHtml(u.house.name)}</span>`:'<span class="text-muted">—</span>'}</td>
-              <td>${escapeHtml(u.position?.title||'—')}</td>
+              <td class="text-sm">${escapeHtml(u.class||'')}${u.section?' '+escapeHtml(u.section):''}${!u.class&&!u.section?'<span class="text-muted">—</span>':''}</td>
               <td><span class="badge ${u.is_active?'badge-success':'badge-neutral'}">${u.is_active?'Active':'Disabled'}</span></td>
               <td class="text-xs text-muted">${formatDate(u.created_at)}</td>
               <td class="text-right">
@@ -2150,9 +2192,6 @@ async function openUserModal(id=null){
     user = data;
   }
 
-  const houseOpts = appCache.houses.map(h=>`<option value="${h.id}" ${user?.house_id===h.id?'selected':''}>${escapeHtml(h.name)}</option>`).join('');
-  const posOpts = appCache.positions.map(p=>`<option value="${p.id}" ${user?.position_id===p.id?'selected':''}>${escapeHtml(p.title)}</option>`).join('');
-
   openModal(
     id ? 'Edit User' : 'Create New User',
     `
@@ -2169,22 +2208,16 @@ async function openUserModal(id=null){
           <div class="field">
             <label class="field-label">Role *</label>
             <select class="field-select" name="role" required>
-              ${['admin','teacher','student','council_member'].map(r=>`<option value="${r}" ${user?.role===r?'selected':''}>${r.replace(/_/g,' ')}</option>`).join('')}
+              ${['admin','teacher','black_badge','house_badge','student'].map(r=>`<option value="${r}" ${user?.role===r?'selected':''}>${r.replace(/_/g,' ')}</option>`).join('')}
             </select>
           </div>
           <div class="field">
-            <label class="field-label">House</label>
-            <select class="field-select" name="house_id">
-              <option value="">No house</option>
-              ${houseOpts}
-            </select>
+            <label class="field-label">Class</label>
+            <input class="field-input" name="class" value="${escapeHtml(user?.class||'')}" />
           </div>
           <div class="field">
-            <label class="field-label">Position</label>
-            <select class="field-select" name="position_id">
-              <option value="">No position</option>
-              ${posOpts}
-            </select>
+            <label class="field-label">Section</label>
+            <input class="field-input" name="section" value="${escapeHtml(user?.section||'')}" />
           </div>
           ${!id ? `
           <div class="field form-grid-2">
@@ -2216,8 +2249,8 @@ async function openUserModal(id=null){
       full_name: fd.get('full_name'),
       username: fd.get('username') || null,
       role: fd.get('role'),
-      house_id: fd.get('house_id') || null,
-      position_id: fd.get('position_id') || null,
+      class: fd.get('class') || null,
+      section: fd.get('section') || null,
       is_active: fd.get('is_active') === 'true'
     };
     if(!payload.full_name){
@@ -2229,7 +2262,6 @@ async function openUserModal(id=null){
       if(id){
         const { error } = await supabase.from('profiles').update(payload).eq('id', id);
         if(error) throw error;
-        await logAudit('update','profiles', id, payload);
         toast('User updated','success');
       }else{
         const email = fd.get('email');
@@ -2246,12 +2278,10 @@ async function openUserModal(id=null){
         if(authError) throw authError;
         const newId = authData.user?.id;
         if(newId){
-          const { error: pErr } = await supabase.from('profiles').upsert({
-            id: newId,
-            ...payload
-          });
-          if(pErr) console.warn('Profile upsert warning:', pErr);
-          await logAudit('create','profiles', newId, payload);
+          // A DB trigger (handle_new_user) already created the base profile row
+          // on signUp; we only need to update it with the admin-selected fields.
+          const { error: pErr } = await supabase.from('profiles').update(payload).eq('id', newId);
+          if(pErr) console.warn('Profile update warning:', pErr);
         }
         toast('User created','success');
       }
@@ -2271,7 +2301,6 @@ async function toggleUserStatus(id, activate){
     async ()=>{
       const { error } = await supabase.from('profiles').update({ is_active: activate }).eq('id', id);
       if(error) throw error;
-      await logAudit(activate?'enable':'disable','profiles', id);
       toast(`User ${activate?'enabled':'disabled'}`, 'success');
       loadUsers();
     },
@@ -2287,7 +2316,6 @@ async function deleteUser(id){
     async ()=>{
       const { error } = await supabase.from('profiles').delete().eq('id', id);
       if(error) throw error;
-      await logAudit('delete','profiles', id);
       toast('User profile deleted','success');
       loadUsers();
     },
@@ -2300,6 +2328,14 @@ async function deleteUser(id){
 let eventsState = { search:'', statusFilter:'', data:[] };
 
 async function renderEvents(){
+  if(!canViewContent()){
+    $('#module-events').innerHTML = `<div class="empty-state">
+      <div class="empty-state-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
+      <div class="empty-state-title">Access restricted</div>
+      <div class="empty-state-text">You do not have permission to view events.</div>
+    </div>`;
+    return;
+  }
   const container = $('#module-events');
   container.innerHTML = `
     <div class="page-header">
@@ -2308,10 +2344,10 @@ async function renderEvents(){
         <div class="page-subtitle">Plan, schedule, and track school council events.</div>
       </div>
       <div class="page-actions">
-        <button class="btn btn-primary-solid" onclick="openEventModal()">
+        ${canManageContent() ? `<button class="btn btn-primary-solid" onclick="openEventModal()">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
           New Event
-        </button>
+        </button>` : ''}
       </div>
     </div>
     <div class="filter-bar">
@@ -2337,7 +2373,7 @@ async function loadEvents(){
   wrap.innerHTML = tableSkeleton();
   try{
     let q = supabase.from('events')
-      .select(`id, name, description, event_date, event_time, venue, location, status, created_at, creator:profiles!events_created_by_fkey(full_name)`)
+      .select(`id, name, description, event_date, event_time, venue, status, created_at, creator:profiles!events_created_by_fkey(full_name)`)
       .order('event_date', { ascending:true });
     if(eventsState.statusFilter) q = q.eq('status', eventsState.statusFilter);
     const { data, error } = await q;
@@ -2394,14 +2430,14 @@ function renderEventsList(events){
             ${ev.description?`<div class="text-sm" style="color:var(--text-muted);margin-bottom:8px">${escapeHtml(ev.description.slice(0,140))}${ev.description.length>140?'…':''}</div>`:''}
             <div class="text-xs text-muted">by ${escapeHtml(ev.creator?.full_name||'Unknown')}</div>
           </div>
-          <div style="display:flex;flex-direction:column;gap:4px">
+          ${canManageContent() ? `<div style="display:flex;flex-direction:column;gap:4px">
             <button class="btn btn-ghost btn-icon" title="Edit" onclick="openEventModal('${ev.id}')">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
             </button>
             <button class="btn btn-ghost btn-icon btn-danger-ghost" title="Delete" onclick="deleteEvent('${ev.id}')">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
             </button>
-          </div>
+          </div>` : ''}
         </div>`;
       }).join('')}
     </div>
@@ -2409,6 +2445,7 @@ function renderEventsList(events){
 }
 
 async function openEventModal(id=null){
+  if(!canManageContent()){ toast('You do not have permission to manage events','warning'); return; }
   let event = null;
   if(id){
     const { data, error } = await supabase.from('events').select('*').eq('id', id).single();
@@ -2467,13 +2504,11 @@ async function openEventModal(id=null){
       if(id){
         const { error } = await supabase.from('events').update(payload).eq('id', id);
         if(error) throw error;
-        await logAudit('update','events', id, payload);
         toast('Event updated','success');
       }else{
         payload.created_by = currentProfile.id;
         const { data, error } = await supabase.from('events').insert(payload).select().single();
         if(error) throw error;
-        await logAudit('create','events', data.id, payload);
         toast('Event created','success');
       }
       closeModal(); loadEvents();
@@ -2485,10 +2520,10 @@ async function openEventModal(id=null){
 }
 
 async function deleteEvent(id){
+  if(!canManageContent()){ toast('You do not have permission to manage events','warning'); return; }
   confirmAction('Delete Event','This event will be permanently deleted.', async ()=>{
     const { error } = await supabase.from('events').delete().eq('id', id);
     if(error) throw error;
-    await logAudit('delete','events', id);
     toast('Event deleted','success');
     loadEvents();
   },'Delete','btn-danger');
@@ -2498,6 +2533,14 @@ async function deleteEvent(id){
 let meetingsState = { search:'', data:[] };
 
 async function renderMeetings(){
+  if(!canViewContent()){
+    $('#module-meetings').innerHTML = `<div class="empty-state">
+      <div class="empty-state-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
+      <div class="empty-state-title">Access restricted</div>
+      <div class="empty-state-text">You do not have permission to view meetings.</div>
+    </div>`;
+    return;
+  }
   const container = $('#module-meetings');
   container.innerHTML = `
     <div class="page-header">
@@ -2506,10 +2549,10 @@ async function renderMeetings(){
         <div class="page-subtitle">Schedule council meetings and record minutes.</div>
       </div>
       <div class="page-actions">
-        <button class="btn btn-primary-solid" onclick="openMeetingModal()">
+        ${canManageContent() ? `<button class="btn btn-primary-solid" onclick="openMeetingModal()">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
           New Meeting
-        </button>
+        </button>` : ''}
       </div>
     </div>
     <div class="filter-bar">
@@ -2569,12 +2612,13 @@ function renderMeetingsList(meetings){
                 <button class="btn btn-ghost btn-icon" title="View" onclick="viewMeeting('${m.id}')">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
                 </button>
+                ${canManageContent() ? `
                 <button class="btn btn-ghost btn-icon" title="Edit" onclick="openMeetingModal('${m.id}')">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
                 </button>
                 <button class="btn btn-ghost btn-icon btn-danger-ghost" title="Delete" onclick="deleteMeeting('${m.id}')">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
-                </button>
+                </button>` : ''}
               </td>
             </tr>
           `).join('')}
@@ -2605,10 +2649,11 @@ async function viewMeeting(id){
       </div>
       <div class="text-xs text-muted">Chaired by ${escapeHtml(data.creator?.full_name||'Unknown')}</div>
     </div>
-  `, `<button class="btn btn-secondary" onclick="closeModal()">Close</button><button class="btn btn-primary-solid" onclick="closeModal();openMeetingModal('${id}')">Edit</button>`);
+  `, `<button class="btn btn-secondary" onclick="closeModal()">Close</button>${canManageContent()?`<button class="btn btn-primary-solid" onclick="closeModal();openMeetingModal('${id}')">Edit</button>`:''}`);
 }
 
 async function openMeetingModal(id=null){
+  if(!canManageContent()){ toast('You do not have permission to manage meetings','warning'); return; }
   let meeting = null;
   if(id){
     const { data, error } = await supabase.from('meetings').select('*').eq('id', id).single();
@@ -2672,13 +2717,11 @@ async function openMeetingModal(id=null){
       if(id){
         const { error } = await supabase.from('meetings').update(payload).eq('id', id);
         if(error) throw error;
-        await logAudit('update','meetings', id, payload);
         toast('Meeting updated','success');
       }else{
         payload.created_by = currentProfile.id;
         const { data, error } = await supabase.from('meetings').insert(payload).select().single();
         if(error) throw error;
-        await logAudit('create','meetings', data.id, payload);
         toast('Meeting created','success');
       }
       closeModal(); loadMeetings();
@@ -2690,10 +2733,10 @@ async function openMeetingModal(id=null){
 }
 
 async function deleteMeeting(id){
+  if(!canManageContent()){ toast('You do not have permission to manage meetings','warning'); return; }
   confirmAction('Delete Meeting','This meeting will be permanently deleted.', async ()=>{
     const { error } = await supabase.from('meetings').delete().eq('id', id);
     if(error) throw error;
-    await logAudit('delete','meetings', id);
     toast('Meeting deleted','success');
     loadMeetings();
   },'Delete','btn-danger');
@@ -2703,6 +2746,14 @@ async function deleteMeeting(id){
 let announcementsState = { search:'', priorityFilter:'', data:[] };
 
 async function renderAnnouncements(){
+  if(!canViewContent()){
+    $('#module-announcements').innerHTML = `<div class="empty-state">
+      <div class="empty-state-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
+      <div class="empty-state-title">Access restricted</div>
+      <div class="empty-state-text">You do not have permission to view announcements.</div>
+    </div>`;
+    return;
+  }
   const container = $('#module-announcements');
   container.innerHTML = `
     <div class="page-header">
@@ -2711,10 +2762,10 @@ async function renderAnnouncements(){
         <div class="page-subtitle">Broadcast news, notices, and circulars with optional PDF attachments.</div>
       </div>
       <div class="page-actions">
-        <button class="btn btn-primary-solid" onclick="openAnnouncementModal()">
+        ${canManageContent() ? `<button class="btn btn-primary-solid" onclick="openAnnouncementModal()">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
           New Announcement
-        </button>
+        </button>` : ''}
       </div>
     </div>
     <div class="filter-bar">
@@ -2793,8 +2844,9 @@ function renderAnnouncementsList(items){
               </div>
               <div style="display:flex;gap:4px">
                 ${a.attachment_url?`<button class="btn btn-ghost btn-icon" title="View PDF" onclick="viewAnnouncementPdf('${a.id}')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg></button>`:''}
+                ${canManageContent() ? `
                 <button class="btn btn-ghost btn-icon" title="Edit" onclick="openAnnouncementModal('${a.id}')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
-                <button class="btn btn-ghost btn-icon btn-danger-ghost" title="Delete" onclick="deleteAnnouncement('${a.id}')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button>
+                <button class="btn btn-ghost btn-icon btn-danger-ghost" title="Delete" onclick="deleteAnnouncement('${a.id}')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button>` : ''}
               </div>
             </div>
             ${a.content?`<div class="text-sm" style="color:var(--text-muted);white-space:pre-wrap;margin-bottom:10px">${escapeHtml(a.content)}</div>`:''}
@@ -2813,6 +2865,7 @@ function renderAnnouncementsList(items){
 }
 
 async function openAnnouncementModal(id=null){
+  if(!canManageContent()){ toast('You do not have permission to manage announcements','warning'); return; }
   let ann = null;
   if(id){
     const { data, error } = await supabase.from('announcements').select('*').eq('id', id).single();
@@ -2883,13 +2936,11 @@ async function openAnnouncementModal(id=null){
       if(id){
         const { error } = await supabase.from('announcements').update(payload).eq('id', id);
         if(error) throw error;
-        await logAudit('update','announcements', id, payload);
         toast('Announcement updated','success');
       }else{
         payload.created_by = currentProfile.id;
         const { data, error } = await supabase.from('announcements').insert(payload).select().single();
         if(error) throw error;
-        await logAudit('create','announcements', data.id, payload);
         toast('Announcement published','success');
       }
       closeModal(); loadAnnouncements();
@@ -2912,10 +2963,10 @@ async function viewAnnouncementPdf(id){
 }
 
 async function deleteAnnouncement(id){
+  if(!canManageContent()){ toast('You do not have permission to manage announcements','warning'); return; }
   confirmAction('Delete Announcement','This announcement will be permanently deleted.', async ()=>{
     const { error } = await supabase.from('announcements').delete().eq('id', id);
     if(error) throw error;
-    await logAudit('delete','announcements', id);
     toast('Announcement deleted','success');
     loadAnnouncements();
   },'Delete','btn-danger');
@@ -2925,12 +2976,20 @@ async function deleteAnnouncement(id){
 let disciplineState = { search:'', statusFilter:'', data:[] };
 
 async function renderDiscipline(){
+  if(!canAccessDiscipline()){
+    $('#module-discipline').innerHTML = `<div class="empty-state">
+      <div class="empty-state-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
+      <div class="empty-state-title">Access restricted</div>
+      <div class="empty-state-text">You do not have permission to view discipline records.</div>
+    </div>`;
+    return;
+  }
   const container = $('#module-discipline');
   container.innerHTML = `
     <div class="page-header">
       <div>
         <div class="page-title">Discipline Management</div>
-        <div class="page-subtitle">Track incidents, approve reports, and issue automatic warnings after 3 approved reports.</div>
+        <div class="page-subtitle">Track incidents and review reports submitted across the school.</div>
       </div>
       <div class="page-actions">
         <button class="btn btn-secondary" onclick="navigateTo('discipline');loadDiscipline(true);"><span style="font-size:11px">All</span></button>
@@ -2962,10 +3021,11 @@ async function loadDiscipline(){
   if(!wrap) return;
   wrap.innerHTML = tableSkeleton();
   try{
+    // student_name / student_class are free text on discipline_reports —
+    // there is no FK to profiles and no "student must exist" validation.
     let q = supabase.from('discipline_reports')
       .select(`
-        id, description, severity, status, incident_date, created_at, reviewed_at,
-        student:profiles!discipline_reports_student_id_fkey(id, full_name, house:houses(name,color)),
+        id, student_name, student_class, description, severity, status, incident_date, created_at, reviewed_at,
         submitted_by:profiles!discipline_reports_submitted_by_fkey(full_name),
         reviewed_by:profiles!discipline_reports_reviewed_by_fkey(full_name)
       `)
@@ -2977,7 +3037,7 @@ async function loadDiscipline(){
     if(disciplineState.search){
       const s = disciplineState.search.toLowerCase();
       filtered = filtered.filter(r=>
-        (r.student?.full_name||'').toLowerCase().includes(s) ||
+        (r.student_name||'').toLowerCase().includes(s) ||
         (r.description||'').toLowerCase().includes(s)
       );
     }
@@ -3028,10 +3088,10 @@ function renderDisciplineList(items){
             <tr>
               <td>
                 <div class="table-avatar">
-                  <div class="table-avatar-circle">${getInitials(r.student?.full_name)}</div>
+                  <div class="table-avatar-circle">${getInitials(r.student_name)}</div>
                   <div>
-                    <div style="font-weight:600">${escapeHtml(r.student?.full_name||'Unknown')}</div>
-                    ${r.student?.house?`<div class="text-xs text-muted">${escapeHtml(r.student.house.name)}</div>`:''}
+                    <div style="font-weight:600">${escapeHtml(r.student_name||'Unknown')}</div>
+                    ${r.student_class?`<div class="text-xs text-muted">${escapeHtml(r.student_class)}</div>`:''}
                   </div>
                 </div>
               </td>
@@ -3043,14 +3103,14 @@ function renderDisciplineList(items){
               <td><span class="badge ${statusColor[r.status]||'badge-neutral'}">${r.status||'pending'}</span></td>
               <td class="text-sm text-muted">${formatDate(r.created_at)}</td>
               <td class="text-right">
-                ${r.status==='pending' && isStaff() ? `
+                ${r.status==='pending' && canReviewDiscipline() ? `
                   <button class="btn btn-success btn-sm" onclick="reviewDiscipline('${r.id}','approved')">Approve</button>
                   <button class="btn btn-danger-ghost btn-sm" onclick="reviewDiscipline('${r.id}','rejected')">Reject</button>
                 ` : ''}
                 <button class="btn btn-ghost btn-icon" title="View" onclick="viewDiscipline('${r.id}')">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
                 </button>
-                ${isStaff()?`<button class="btn btn-ghost btn-icon btn-danger-ghost" title="Delete" onclick="deleteDiscipline('${r.id}')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button>`:''}
+                ${canReviewDiscipline()?`<button class="btn btn-ghost btn-icon btn-danger-ghost" title="Delete" onclick="deleteDiscipline('${r.id}')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button>`:''}
               </td>
             </tr>
           `).join('')}
@@ -3061,23 +3121,31 @@ function renderDisciplineList(items){
 }
 
 async function openDisciplineModal(){
+  if(!canAccessDiscipline()){ toast('You do not have permission to submit discipline reports','warning'); return; }
+
+  // The name list below is purely a convenience autocomplete — student_name
+  // is a free-text field on discipline_reports with no FK to profiles, and
+  // submission is NEVER blocked if the typed name doesn't match a profile.
   const { data: students } = await supabase
     .from('profiles')
-    .select('id, full_name, house:houses(name)')
+    .select('full_name, class')
     .eq('is_active', true)
-    .in('role', ['student','council_member'])
     .order('full_name');
-  const stuOpts = (students||[]).map(s=>`<option value="${escapeHtml(s.full_name)}">${escapeHtml(s.full_name)}${s.house?` — ${escapeHtml(s.house.name)}`:''}</option>`).join('');
+  const stuOpts = (students||[]).map(s=>`<option value="${escapeHtml(s.full_name)}"></option>`).join('');
 
   openModal(
     'New Discipline Report',
     `<form id="discForm">
-      <div class="field">
-        <label class="field-label">Student *</label>
-        <input class="field-input" list="studentList" name="student_name" id="studentInput" required placeholder="Search active student..." autocomplete="off" />
-        <datalist id="studentList">
-          ${stuOpts}
-        </datalist>
+      <div class="form-grid">
+        <div class="field">
+          <label class="field-label">Student Name *</label>
+          <input class="field-input" list="studentList" name="student_name" id="studentInput" required placeholder="Type student name..." autocomplete="off" />
+          <datalist id="studentList">${stuOpts}</datalist>
+        </div>
+        <div class="field">
+          <label class="field-label">Class</label>
+          <input class="field-input" name="student_class" placeholder="e.g. 10-A" />
+        </div>
       </div>
       <div class="form-grid">
         <div class="field">
@@ -3103,24 +3171,20 @@ async function openDisciplineModal(){
   );
   $('#saveDiscBtn').addEventListener('click', async ()=>{
     const fd = new FormData($('#discForm'));
-    const selectedName = fd.get('student_name');
-    const selectedStudent = (students||[]).find(s => s.full_name === selectedName);
-    if(!selectedStudent){ toast('Please select a valid student from the list','warning'); return; }
-    
     const payload = {
-      student_id: selectedStudent.id,
+      student_name: (fd.get('student_name')||'').trim(),
+      student_class: (fd.get('student_class')||'').trim() || null,
       incident_date: fd.get('incident_date') ? new Date(fd.get('incident_date')).toISOString() : null,
       severity: fd.get('severity'),
       description: fd.get('description'),
       status: 'pending',
       submitted_by: currentProfile.id
     };
-    if(!payload.student_id || !payload.description){ toast('Student and description are required','warning'); return; }
+    if(!payload.student_name || !payload.description){ toast('Student name and description are required','warning'); return; }
     const btn = $('#saveDiscBtn'); btn.disabled=true; btn.textContent='Submitting...';
     try{
       const { data, error } = await supabase.from('discipline_reports').insert(payload).select().single();
       if(error) throw error;
-      await logAudit('create','discipline_reports', data.id, payload);
       toast('Report submitted','success');
       closeModal(); loadDiscipline();
     }catch(e){
@@ -3132,16 +3196,16 @@ async function openDisciplineModal(){
 
 async function viewDiscipline(id){
   const { data, error } = await supabase.from('discipline_reports')
-    .select(`*, student:profiles!discipline_reports_student_id_fkey(full_name, house:houses(name)), submitted_by:profiles!discipline_reports_submitted_by_fkey(full_name), reviewed_by:profiles!discipline_reports_reviewed_by_fkey(full_name)`)
+    .select(`*, submitted_by:profiles!discipline_reports_submitted_by_fkey(full_name), reviewed_by:profiles!discipline_reports_reviewed_by_fkey(full_name)`)
     .eq('id', id).single();
   if(error){ toast('Failed to load','error'); return; }
   openModal('Discipline Report',
     `<div style="display:flex;flex-direction:column;gap:14px">
       <div style="display:flex;gap:14px;align-items:center">
-        <div class="table-avatar-circle" style="width:48px;height:48px;font-size:16px">${getInitials(data.student?.full_name)}</div>
+        <div class="table-avatar-circle" style="width:48px;height:48px;font-size:16px">${getInitials(data.student_name)}</div>
         <div>
-          <div style="font-weight:600">${escapeHtml(data.student?.full_name||'Unknown')}</div>
-          <div class="text-xs text-muted">${data.student?.house?`· ${escapeHtml(data.student.house.name)}`:''}</div>
+          <div style="font-weight:600">${escapeHtml(data.student_name||'Unknown')}</div>
+          <div class="text-xs text-muted">${data.student_class?escapeHtml(data.student_class):''}</div>
         </div>
       </div>
       <div>
@@ -3161,32 +3225,31 @@ async function viewDiscipline(id){
 }
 
 async function reviewDiscipline(id, decision){
+  if(!canReviewDiscipline()){ toast('Only admins and teachers can review discipline reports','warning'); return; }
   const action = decision==='approved'?'Approve':'Reject';
   confirmAction(
     `${action} Report`,
     decision==='approved'
-      ? 'Approving this report will count towards automatic warning issuance after 3 approvals.'
+      ? 'Approving this report will count towards this student\'s approved-report history.'
       : 'Rejecting this report will mark it as closed with no further action.',
     async ()=>{
       const payload = { status: decision, reviewed_by: currentProfile.id, reviewed_at: new Date().toISOString() };
       const { error } = await supabase.from('discipline_reports').update(payload).eq('id', id);
       if(error) throw error;
-      await logAudit(decision,'discipline_reports', id, payload);
 
       if(decision==='approved'){
         try{
           const { data: report } = await supabase.from('discipline_reports')
-            .select('student_id').eq('id', id).single();
-          if(report?.student_id){
+            .select('student_name').eq('id', id).single();
+          if(report?.student_name){
             const { data: approved } = await supabase.from('discipline_reports')
-              .select('id').eq('student_id', report.student_id).eq('status','approved');
+              .select('id').eq('student_name', report.student_name).eq('status','approved');
             const count = (approved||[]).length;
             if(count>=3 && count%3===0){
-              // Auto-issue warning logic if warnings table exists
-              toast(`Automatic warning issued (${count} reports)`,'warning',5000);
+              toast(`Note: ${report.student_name} now has ${count} approved reports`,'warning',5000);
             }
           }
-        }catch(e){ console.warn('Warning check failed:', e); }
+        }catch(e){ console.warn('Report count check failed:', e); }
       }
       toast(`Report ${decision}`,'success');
       loadDiscipline();
@@ -3197,10 +3260,10 @@ async function reviewDiscipline(id, decision){
 }
 
 async function deleteDiscipline(id){
+  if(!canReviewDiscipline()){ toast('Only admins and teachers can delete discipline reports','warning'); return; }
   confirmAction('Delete Report','This report will be permanently deleted.', async ()=>{
     const { error } = await supabase.from('discipline_reports').delete().eq('id', id);
     if(error) throw error;
-    await logAudit('delete','discipline_reports', id);
     toast('Report deleted','success');
     loadDiscipline();
   },'Delete','btn-danger');
@@ -3210,6 +3273,14 @@ async function deleteDiscipline(id){
 let hpiState = { academicYear: `${new Date().getFullYear()}-${new Date().getFullYear()+1}` };
 
 async function renderHPI(){
+  if(!canViewHPI()){
+    $('#module-hpi').innerHTML = `<div class="empty-state">
+      <div class="empty-state-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
+      <div class="empty-state-title">Access restricted</div>
+      <div class="empty-state-text">You do not have permission to view House Performance Index data.</div>
+    </div>`;
+    return;
+  }
   const container = $('#module-hpi');
   container.innerHTML = `
     <div class="page-header">
@@ -3218,7 +3289,7 @@ async function renderHPI(){
         <div class="page-subtitle">Aggregate scores across categories to rank houses by overall performance.</div>
       </div>
       <div class="page-actions">
-        ${isStaff()?`<button class="btn btn-primary-solid" onclick="openHpiVoteModal()">
+        ${canVoteHPI()?`<button class="btn btn-primary-solid" onclick="openHpiVoteModal()">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
           Add Score
         </button>`:''}
@@ -3364,11 +3435,12 @@ async function loadHPI(){
 }
 
 async function openHpiVoteModal(){
+  if(!canVoteHPI()){ toast('Only admins and teachers can vote on House Performance scores','warning'); return; }
   if(!appCache.houses.length || !appCache.categories.length){
     toast('Houses or categories not configured','warning'); return;
   }
   const houseOpts = appCache.houses.map(h=>`<option value="${h.id}">${escapeHtml(h.name)}</option>`).join('');
-  const catOpts = appCache.categories.map(c=>`<option value="${c.id}">${escapeHtml(c.name)} (max ${c.max_score||100})</option>`).join('');
+  const catOpts = appCache.categories.map(c=>`<option value="${c.id}" data-max="${c.max_score||100}">${escapeHtml(c.name)} (max ${c.max_score||100})</option>`).join('');
 
   openModal(
     'Add HPI Score',
@@ -3380,21 +3452,30 @@ async function openHpiVoteModal(){
         </div>
         <div class="field">
           <label class="field-label">Category *</label>
-          <select class="field-select" name="category_id" required>${catOpts}</select>
+          <select class="field-select" name="category_id" id="hpiCategorySelect" required>${catOpts}</select>
         </div>
         <div class="field">
           <label class="field-label">Score *</label>
-          <input class="field-input" type="number" name="score" min="0" max="100" value="0" required />
+          <input class="field-input" type="number" name="score" id="hpiScoreInput" min="0" max="${appCache.categories[0]?.max_score||100}" value="0" required />
         </div>
         <div class="field">
           <label class="field-label">Academic Year</label>
           <input class="field-input" name="academic_year" value="${hpiState.academicYear}" />
         </div>
       </div>
+      <div class="field-hint">Submitting a score for a house/category/year you've already scored will update your existing vote rather than duplicate it.</div>
     </form>`,
     `<button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
      <button class="btn btn-primary-solid" id="saveHpiBtn">Add Score</button>`
   );
+
+  const catSelect = $('#hpiCategorySelect');
+  const scoreInput = $('#hpiScoreInput');
+  catSelect.addEventListener('change', ()=>{
+    const max = catSelect.selectedOptions[0]?.dataset.max || 100;
+    scoreInput.max = max;
+  });
+
   $('#saveHpiBtn').addEventListener('click', async ()=>{
     const fd = new FormData($('#hpiForm'));
     const payload = {
@@ -3407,10 +3488,15 @@ async function openHpiVoteModal(){
     if(isNaN(payload.score) || payload.score<0){ toast('Enter a valid score','warning'); return; }
     const btn = $('#saveHpiBtn'); btn.disabled=true; btn.textContent='Saving...';
     try{
-      const { data, error } = await supabase.from('hpi_votes').insert(payload).select().single();
+      // hpi_votes has a unique constraint on (house_id, category_id,
+      // academic_year, voted_by) — upsert so re-scoring updates the
+      // existing vote instead of failing with a duplicate-key error.
+      const { data, error } = await supabase
+        .from('hpi_votes')
+        .upsert(payload, { onConflict: 'house_id,category_id,academic_year,voted_by' })
+        .select().single();
       if(error) throw error;
-      await logAudit('create','hpi_votes', data.id, payload);
-      toast('Score added','success');
+      toast('Score saved','success');
       closeModal(); loadHPI();
     }catch(e){
       toast(e.message||'Save failed','error');
@@ -3504,7 +3590,6 @@ async function renderSettings(){
       currentProfile.full_name = payload.full_name;
       currentProfile.username = payload.username;
       renderApp();
-      await logAudit('update','profiles', currentProfile.id, payload);
       toast('Profile updated','success');
     }catch(e){
       toast(e.message||'Update failed','error');
@@ -3523,7 +3608,6 @@ async function renderSettings(){
     try{
       const { error } = await supabase.auth.updateUser({ password: np });
       if(error) throw error;
-      await logAudit('password_change','auth', currentProfile.id);
       toast('Password updated','success');
       $('#passwordForm').reset();
     }catch(e){
@@ -3704,11 +3788,9 @@ async function openHouseModal(id=null){
       if(id){
         const { error } = await supabase.from('houses').update(payload).eq('id', id);
         if(error) throw error;
-        await logAudit('update','houses', id, payload);
       }else{
         const { data, error } = await supabase.from('houses').insert(payload).select().single();
         if(error) throw error;
-        await logAudit('create','houses', data.id, payload);
       }
       toast('House saved','success');
       closeModal();
@@ -3725,7 +3807,6 @@ async function deleteHouse(id){
   confirmAction('Delete House','This will remove the house. Existing members may need reassignment.', async ()=>{
     const { error } = await supabase.from('houses').delete().eq('id', id);
     if(error) throw error;
-    await logAudit('delete','houses', id);
     toast('House deleted','success');
     await loadAppCache();
     loadSettingsAdmin();
@@ -3764,11 +3845,9 @@ async function openPositionModal(id=null){
       if(id){
         const { error } = await supabase.from('positions').update(payload).eq('id', id);
         if(error) throw error;
-        await logAudit('update','positions', id, payload);
       }else{
         const { data, error } = await supabase.from('positions').insert(payload).select().single();
         if(error) throw error;
-        await logAudit('create','positions', data.id, payload);
       }
       toast('Position saved','success');
       closeModal();
@@ -3785,7 +3864,6 @@ async function deletePosition(id){
   confirmAction('Delete Position','This will remove the position.', async ()=>{
     const { error } = await supabase.from('positions').delete().eq('id', id);
     if(error) throw error;
-    await logAudit('delete','positions', id);
     toast('Position deleted','success');
     await loadAppCache();
     loadSettingsAdmin();
@@ -3827,11 +3905,9 @@ async function openCategoryModal(id=null){
       if(id){
         const { error } = await supabase.from('hpi_categories').update(payload).eq('id', id);
         if(error) throw error;
-        await logAudit('update','hpi_categories', id, payload);
       }else{
         const { data, error } = await supabase.from('hpi_categories').insert(payload).select().single();
         if(error) throw error;
-        await logAudit('create','hpi_categories', data.id, payload);
       }
       toast('Category saved','success');
       closeModal();
@@ -3848,7 +3924,6 @@ async function deleteCategory(id){
   confirmAction('Delete Category','This will remove the category and its related votes.', async ()=>{
     const { error } = await supabase.from('hpi_categories').delete().eq('id', id);
     if(error) throw error;
-    await logAudit('delete','hpi_categories', id);
     toast('Category deleted','success');
     await loadAppCache();
     loadSettingsAdmin();
